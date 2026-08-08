@@ -1,422 +1,290 @@
-import json
 import re
 import html
+from collections import Counter
 import streamlit as st
-from openai import OpenAI
+from ddgs import DDGS
 
 MAX_TITLE = 60
 
-st.set_page_config(
-    page_title="Wise Part Number",
-    page_icon="🏍️",
-    layout="centered",
-)
+st.set_page_config(page_title="Wise Part Number", page_icon="🏍️", layout="centered")
 
 st.markdown("""
 <style>
-.stApp { background: #090909; color: #f6f6f6; }
-h1, h2, h3 { color: #ffd400 !important; }
-.block-container { max-width: 760px; padding-top: 2rem; }
-
-.stTextInput input {
-    font-size: 22px !important;
-    font-weight: 700 !important;
-    text-transform: uppercase;
-}
-
-.stButton > button {
-    width: 100%;
-    min-height: 52px;
-    border-radius: 10px;
-    font-weight: 800;
-    font-size: 18px;
-}
-
-.wise-card {
-    border: 1px solid #2d2d2d;
-    background: #141414;
-    border-radius: 14px;
-    padding: 18px;
-    margin: 12px 0;
-}
-
-.title-result {
-    font-size: 25px;
-    line-height: 1.25;
-    font-weight: 900;
-}
-
-.small-muted {
-    color: #aaa;
-    font-size: 14px;
-}
+.stApp {background:#090909;color:#f6f6f6}
+h1,h2,h3 {color:#ffd400!important}
+.block-container {max-width:800px;padding-top:2rem}
+.stTextInput input {font-size:22px!important;font-weight:700!important;text-transform:uppercase}
+.stButton>button {width:100%;min-height:50px;border-radius:10px;font-weight:800}
+.card {border:1px solid #333;background:#141414;border-radius:14px;padding:18px;margin:12px 0}
+.title {font-size:24px;font-weight:900}
+.muted {color:#aaa;font-size:13px}
 </style>
 """, unsafe_allow_html=True)
 
+def canonical(v):
+    return re.sub(r"[^A-Z0-9]", "", (v or "").upper())
 
-def get_api_key():
-    try:
-        return st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        return None
-
-
-def canonical_partnumber(value: str) -> str:
-    """
-    Forma canônica para comparação:
-    - maiúsculas
-    - remove espaços
-    - remove hífens
-    - remove pontos, barras e outros separadores
-    - mantém apenas letras e números
-
-    Ex:
-    59c-27488-00 -> 59C2748800
-    59C 27488 00 -> 59C2748800
-    """
-    value = (value or "").strip().upper()
-    return re.sub(r"[^A-Z0-9]", "", value)
-
-
-def display_partnumber(value: str) -> str:
-    """
-    Mantém uma apresentação limpa daquilo que o usuário digitou,
-    sem obrigar um padrão de hífen específico.
-    """
-    value = (value or "").strip().upper()
-    value = re.sub(r"\s+", "", value)
-    return value
-
-
-def generate_partnumber_variants(value: str):
-    """
-    Gera variações úteis para busca sem assumir que todas as marcas
-    usam a mesma estrutura de part number.
-    """
-    original = display_partnumber(value)
-    canonical = canonical_partnumber(value)
-
-    variants = []
-
-    def add(v):
-        v = (v or "").strip()
-        if v and v not in variants:
-            variants.append(v)
-
-    add(original)
-    add(canonical)
-
-    # Variações de caixa
-    add(original.lower())
-    add(canonical.lower())
-
-    # Troca separadores comuns por hífen / espaço
-    cleaned = re.sub(r"[._/\s]+", "-", original)
-    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
-    add(cleaned)
-    add(cleaned.replace("-", " "))
-    add(cleaned.replace("-", ""))
-
-    # Se o usuário já forneceu blocos, reaproveita esses blocos.
-    blocks = [b for b in re.split(r"[^A-Za-z0-9]+", value.strip()) if b]
-    if len(blocks) >= 2:
-        blocks_upper = [b.upper() for b in blocks]
-        add("-".join(blocks_upper))
-        add(" ".join(blocks_upper))
-        add("".join(blocks_upper))
-
-    # Alguns formatos OEM comuns. Só gera variantes de busca;
-    # não afirma que sejam a formatação "correta".
-    n = len(canonical)
-
-    patterns = {
-        9: [(3, 3, 3)],
-        10: [(3, 5, 2), (5, 3, 2)],
-        11: [(5, 3, 3), (3, 5, 3)],
-        12: [(5, 3, 4), (4, 4, 4)],
-    }
-
-    for pattern in patterns.get(n, []):
-        pos = 0
-        parts = []
-        valid = True
-        for size in pattern:
-            chunk = canonical[pos:pos+size]
-            if not chunk:
-                valid = False
-                break
-            parts.append(chunk)
-            pos += size
-        if valid and pos == n:
-            add("-".join(parts))
-            add(" ".join(parts))
-
-    return variants
-
-
-def clean(text: str) -> str:
-    text = (text or "").replace("–", "-").replace("—", "-")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def fit_title(title: str, limit: int = MAX_TITLE) -> str:
-    title = clean(title)
-
-    if len(title) <= limit:
-        return title
-
-    replacements = [
-        (r"\bLado Direito\b", "Direito"),
-        (r"\bLado Esquerdo\b", "Esquerdo"),
-        (r"\bTraseiro\b", "Tras"),
-        (r"\bDianteiro\b", "Diant"),
-        (r"\bOriginal Genu[ií]no\b", "Original"),
-        (r"\bGenu[ií]no\b", "Original"),
-        (r"\b(\d{4}) a (\d{4})\b", r"\1-\2"),
-    ]
-
-    for pattern, repl in replacements:
-        title = re.sub(pattern, repl, title, flags=re.I)
-        title = clean(title)
-        if len(title) <= limit:
-            return title
-
-    words = title.split()
-    removable = {
-        "PARA", "COMPATÍVEL", "COMPATIVEL",
-        "PEÇA", "PECA", "MOTOCICLETA", "MOTO"
-    }
-
-    words = [w for w in words if w.upper() not in removable]
-    title = " ".join(words)
-
-    if len(title) <= limit:
-        return title
-
+def variants(v):
+    raw = (v or "").strip().upper()
+    can = canonical(raw)
     out = []
-    for word in title.split():
-        candidate = " ".join(out + [word])
-        if len(candidate) > limit:
+    def add(x):
+        if x and x not in out: out.append(x)
+    add(raw); add(can)
+    blocks = [x for x in re.split(r"[^A-Z0-9]+", raw) if x]
+    if len(blocks) > 1:
+        add("-".join(blocks)); add(" ".join(blocks))
+    n=len(can)
+    for pat in {9:[(3,3,3)],10:[(3,5,2),(5,3,2)],11:[(5,3,3),(3,5,3)],12:[(5,3,4)]}.get(n,[]):
+        p=0; b=[]
+        for size in pat:
+            b.append(can[p:p+size]); p+=size
+        add("-".join(b)); add(" ".join(b))
+    return out
+
+def fit_title(s):
+    s=re.sub(r"\s+"," ",s).strip(" -|")
+    for a,b in [
+        (" Peça Original"," Original"),(" Genuíno"," Original"),
+        (" Genuino"," Original"),(" Lado Direito"," Direito"),
+        (" Lado Esquerdo"," Esquerdo")]:
+        s=s.replace(a,b)
+    s=re.sub(r"(\d{4})\s+a\s+(\d{4})",r"\1-\2",s,flags=re.I)
+    if len(s)<=60:return s
+    words=s.split(); out=[]
+    for w in words:
+        if len(" ".join(out+[w]))>60:break
+        out.append(w)
+    return " ".join(out)
+
+def search_web(pn):
+    qs=[]
+    vs=variants(pn)
+    # Search multiple exact variants plus motorcycle context.
+    for v in vs[:5]:
+        qs.append(f'"{v}" moto peça')
+    results=[]; seen=set()
+    with DDGS() as d:
+        for q in qs:
+            try:
+                for r in d.text(q, max_results=8):
+                    url=r.get("href","")
+                    if url and url not in seen:
+                        seen.add(url)
+                        results.append({
+                            "title":r.get("title",""),
+                            "body":r.get("body",""),
+                            "url":url
+                        })
+            except Exception:
+                pass
+    return results
+
+PART_TERMS = [
+    "CAPA DO SILENCIADOR", "PROTETOR DO SILENCIADOR", "PROTETOR DO TUBO DE ESCAPE",
+    "CAPA PROTEÇÃO DO ESCAPAMENTO", "CAPA PROTECAO DO ESCAPAMENTO",
+    "CARENAGEM", "RABETA", "PARALAMA", "FAROL", "LANTERNA", "PISCA",
+    "SUPORTE", "PEDALEIRA", "MANOPLA", "MANETE", "RADIADOR", "PAINEL",
+    "BENGALA", "MESA SUPERIOR", "MESA INFERIOR", "BALANÇA", "BALANCA",
+    "BOMBA DE COMBUSTÍVEL", "BOMBA DE COMBUSTIVEL", "ESTATOR", "RETIFICADOR",
+    "VENTOINHA", "CHICOTE", "SENSOR", "TAMPA", "EMBREAGEM", "CABEÇOTE",
+    "CABECOTE", "MOTOR DE PARTIDA", "CDI", "ECM", "ESPELHO", "ESCAPAMENTO",
+    "SILENCIADOR", "PARAFUSO", "ARRUELA", "GAXETA", "VEDAÇÃO", "VEDACAO",
+    "COXIM", "BUCHA", "ROLAMENTO", "GUIDÃO", "GUIDAO"
+]
+
+BRANDS = [
+    "YAMAHA","HONDA","SUZUKI","KAWASAKI","BMW","DUCATI","BUELL",
+    "HARLEY-DAVIDSON","HARLEY DAVIDSON","TRIUMPH","DAFRA","SHINERAY",
+    "ROYAL ENFIELD","KTM","KYMCO","KASINSKI","HAOJUE"
+]
+
+def extract_identity(results, pn):
+    """Extrai evidências dos snippets sem IA e privilegia descrições OEM explícitas."""
+    can = canonical(pn)
+    texts = []
+    for r in results:
+        blob = html.unescape((r.get("title","") + " " + r.get("body","")).upper())
+        compact = re.sub(r"[^A-Z0-9]", "", blob)
+        # Prioriza páginas onde o PN realmente aparece.
+        if can in compact:
+            texts.append(blob)
+
+    if not texts:
+        texts = [html.unescape((r.get("title","")+" "+r.get("body","")).upper()) for r in results]
+
+    joined = " ".join(texts)
+
+    # Nome da peça: procura vocabulário técnico próximo ao código e também termos conhecidos.
+    found_parts = []
+    for term in PART_TERMS:
+        count = joined.count(term)
+        if count:
+            found_parts.append((count, len(term), term))
+    found_parts.sort(reverse=True)
+
+    peca = found_parts[0][2].title() if found_parts else ""
+
+    # Corrige capitalização técnica comum.
+    fixes = {
+        "Capa Do Silenciador":"Capa do Silenciador",
+        "Protetor Do Silenciador":"Protetor do Silenciador",
+        "Protetor Do Tubo De Escape":"Protetor do Tubo de Escape",
+        "Capa Proteção Do Escapamento":"Capa Proteção do Escapamento",
+        "Capa Protecao Do Escapamento":"Capa Proteção do Escapamento",
+        "Bomba De Combustível":"Bomba de Combustível",
+        "Bomba De Combustivel":"Bomba de Combustível",
+        "Motor De Partida":"Motor de Partida",
+    }
+    peca = fixes.get(peca, peca)
+
+    marca = ""
+    for b in BRANDS:
+        if b in joined:
+            marca = b.title().replace("Bmw","BMW").replace("Ktm","KTM")
             break
-        out.append(word)
 
-    return " ".join(out).rstrip(" -")
+    # Modelos: extrai expressões recorrentes em resultados.
+    model_patterns = [
+        r"\bYS\s*250\b", r"\bFAZER\s*250\b", r"\bFZ25\b", r"\bMT[- ]?03\b",
+        r"\bYZF[- ]?R3\b", r"\bNMAX\s*160\b", r"\bLANDER\s*250\b",
+        r"\bCROSSER\s*150\b", r"\bFACTOR\s*(?:125|150)\b",
+        r"\bCG\s*(?:125|150|160)\b", r"\bCBX\s*250\b", r"\bCB\s*300R?\b",
+        r"\bXRE\s*300\b", r"\bBROS\s*160\b", r"\bPCX\s*(?:150|160)\b",
+        r"\bCBR\s*\d+\w*\b", r"\bNINJA\s*\d+\b"
+    ]
+    mods=[]
+    for pat in model_patterns:
+        for m in re.findall(pat, joined, flags=re.I):
+            val=re.sub(r"\s+"," ",m.upper()).strip()
+            if val not in mods: mods.append(val)
+    modelos = " / ".join(mods[:3])
 
+    # Anos: encontra faixas explícitas como 2011 a 2017, 11-17.
+    ranges=[]
+    for a,b in re.findall(r"\b(20\d{2})\s*(?:A|ATÉ|ATE|-)\s*(20\d{2})\b", joined):
+        pair=(int(a),int(b))
+        if 1990 <= pair[0] <= pair[1] <= 2035: ranges.append(pair)
+    for a,b in re.findall(r"\b(\d{2})\s*[-/]\s*(\d{2})\b", joined):
+        aa,bb=2000+int(a),2000+int(b)
+        if 2000 <= aa <= bb <= 2035: ranges.append((aa,bb))
+    anos=""
+    if ranges:
+        counts=Counter(ranges)
+        best=counts.most_common(1)[0][0]
+        anos=f"{best[0]} a {best[1]}"
 
-def extract_json(text: str):
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
+    # Evidências mais úteis.
+    evidence=[]
+    for r in results:
+        blob=(r.get("title","")+" "+r.get("body",""))
+        if can in canonical(blob):
+            evidence.append(r)
+    if not evidence: evidence=results
 
-    try:
-        return json.loads(text)
-    except Exception:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise ValueError("A resposta não retornou JSON válido.")
-        return json.loads(match.group(0))
+    return {
+        "peca": peca,
+        "marca": marca,
+        "modelos": modelos,
+        "anos": anos,
+        "evidence": evidence[:12]
+    }
 
+def keyword_text(data, pn):
+    bits=[data.get("peca",""),data.get("marca",""),data.get("modelos",""),data.get("anos",""),pn,canonical(pn)]
+    vals=[]
+    for x in bits:
+        x=str(x).strip()
+        if x and x not in vals: vals.append(x)
+    return ", ".join(vals)
 
-def lookup_part(client: OpenAI, user_input: str):
-    canonical = canonical_partnumber(user_input)
-    variants = generate_partnumber_variants(user_input)
+def description(data,pn):
+    p=data.get("peca","Peça"); m=data.get("marca",""); mod=data.get("modelos",""); anos=data.get("anos","")
+    ident=" ".join(x for x in [p,m,mod,anos] if x).strip()
+    return f"""Esse anúncio contém: {ident}.
 
-    variants_text = "\n".join(f"- {v}" for v in variants)
+Código da peça: {pn}
 
-    prompt = f"""
-Você é um catalogador técnico especializado em peças de motocicletas para e-commerce brasileiro.
+Produto para aplicação informada acima. Antes da compra, favor conferir atentamente o código da peça, modelo, ano e as fotos do anúncio para confirmar a compatibilidade com sua motocicleta."""
 
-O colaborador digitou este part number:
-{user_input}
+def meta(data):
+    txt=" ".join(x for x in [data.get("peca",""),data.get("marca",""),data.get("modelos",""),data.get("anos","")] if x).strip()
+    base=f"{txt}. Consulte código, aplicação e fotos antes da compra."
+    return base[:160].rstrip()
 
-Forma canônica sem separadores:
-{canonical}
-
-Variações equivalentes que DEVEM ser consideradas na pesquisa:
-{variants_text}
-
-IMPORTANTE:
-- Maiúsculas e minúsculas NÃO diferenciam um part number.
-- Hífens, espaços, pontos e barras podem variar entre catálogos.
-- Considere códigos equivalentes quando, removendo separadores e ignorando maiúsculas/minúsculas, o código alfanumérico for o mesmo.
-- Pesquise tanto o código formatado quanto a forma sem separadores.
-- Não descarte um resultado apenas porque o site usa hífen e o usuário não usou, ou vice-versa.
-- Não invente compatibilidade.
-
-Sua tarefa:
-1. Identificar corretamente o nome da peça.
-2. Identificar a marca.
-3. Identificar o modelo ou modelos.
-4. Identificar anos de aplicação.
-5. Criar um título para Mercado Livre com no máximo 60 caracteres.
-
-Regras do título:
-- Prioridade: PEÇA + MARCA + MODELO + ANOS.
-- Marca antes do modelo.
-- Linguagem natural de busca no Brasil.
-- Use "Original" somente quando houver evidência de OEM/genuíno.
-- Não use palavras promocionais.
-- Não coloque o part number no título, salvo se não houver identificação melhor.
-- Se houver várias aplicações, use a principal no título e liste todas abaixo.
-- Limite absoluto: 60 caracteres.
-
-Retorne SOMENTE JSON válido:
-{{
-  "partnumber_digitado": "{display_partnumber(user_input)}",
-  "partnumber_canonico": "{canonical}",
-  "partnumber_identificado": "",
-  "peca": "",
-  "marca": "",
-  "modelos": [""],
-  "anos": "",
-  "titulo": "",
-  "confianca": "alta|media|baixa",
-  "observacao": "",
-  "fontes": [
-    {{"nome": "", "url": ""}}
-  ]
-}}
-"""
-
-    response = client.responses.create(
-        model=st.secrets.get("OPENAI_MODEL", "gpt-5"),
-        tools=[{"type": "web_search"}],
-        input=prompt,
-    )
-
-    return extract_json(response.output_text)
-
+for k,v in {"results":None,"candidate":{},"confirmed":False}.items():
+    if k not in st.session_state: st.session_state[k]=v
 
 st.title("🏍️ Wise Part Number")
-st.caption("Identificação de peça + título de Mercado Livre em até 60 caracteres.")
+st.caption("Versão 3.1 • motor de identificação corrigido")
+st.caption("Pesquisa gratuita na web • sem OpenAI API e sem créditos.")
 
-if not get_api_key():
-    st.error("O aplicativo ainda não foi configurado pelo administrador.")
-    st.stop()
+pn=st.text_input("Digite o Part Number",placeholder="Ex.: B97-F3121-00 ou b97f312100")
+st.caption("Maiúsculas, minúsculas, hífens e espaços são tratados automaticamente.")
 
-pn_input = st.text_input(
-    "Digite o Part Number",
-    placeholder="Ex.: 59C-27488-00 ou 59c2748800",
-)
+if st.button("🔎 PESQUISAR PEÇA",type="primary"):
+    if not canonical(pn):
+        st.warning("Digite um part number válido."); st.stop()
+    with st.spinner("Pesquisando o código na web..."):
+        res=search_web(pn)
+    st.session_state.results=res
+    st.session_state.candidate={}
+    st.session_state.confirmed=False
 
-st.caption("Pode digitar com ou sem hífen, com espaços, maiúsculas ou minúsculas.")
-
-search = st.button("🔎 PESQUISAR PEÇA", type="primary")
-
-if search:
-    if not pn_input.strip():
-        st.warning("Digite um part number.")
-        st.stop()
-
-    canonical = canonical_partnumber(pn_input)
-
-    if not canonical:
-        st.warning("Digite um part number válido.")
-        st.stop()
-
-    client = OpenAI(api_key=get_api_key())
-
-    with st.spinner("Pesquisando código, variações e aplicações..."):
-        try:
-            data = lookup_part(client, pn_input)
-        except Exception as e:
-            st.error(f"Erro na pesquisa: {e}")
-            st.stop()
-
-    raw_title = clean(data.get("titulo", ""))
-    title = fit_title(raw_title)
-
-    if not title:
-        st.error("Não foi possível gerar um título seguro para esse código.")
-        st.stop()
-
-    title_safe = html.escape(title)
-
-    st.markdown(
-        f"""
-        <div class="wise-card">
-            <div class="small-muted">TÍTULO MERCADO LIVRE</div>
-            <div class="title-result">{title_safe}</div>
-            <div class="small-muted">{len(title)}/60 caracteres</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    safe_js = (
-        title
-        .replace("\\", "\\\\")
-        .replace("`", "\\`")
-        .replace("${", "\\${")
-    )
-
-    st.components.v1.html(
-        f"""
-        <button onclick="navigator.clipboard.writeText(`{safe_js}`); this.innerText='✓ COPIADO';"
-            style="
-                width:100%;
-                height:48px;
-                border:0;
-                border-radius:9px;
-                background:#ffd400;
-                color:#111;
-                font-weight:900;
-                font-size:17px;
-                cursor:pointer;">
-            📋 COPIAR TÍTULO
-        </button>
-        """,
-        height=58,
-    )
-
-    st.subheader("Identificação")
-
-    entered = display_partnumber(pn_input)
-    identified = data.get("partnumber_identificado") or entered
-
-    st.write(f"**Código digitado:** {entered}")
-    st.write(f"**Código identificado:** {identified}")
-    st.write(f"**Peça:** {data.get('peca') or 'Não identificada'}")
-    st.write(f"**Marca:** {data.get('marca') or 'Não identificada'}")
-
-    modelos = data.get("modelos", [])
-    if isinstance(modelos, list):
-        modelos = ", ".join(str(x) for x in modelos if x)
-
-    st.write(f"**Modelos:** {modelos or 'Não identificados'}")
-    st.write(f"**Anos de aplicação:** {data.get('anos') or 'Não encontrados'}")
-
-    conf = str(data.get("confianca", "")).lower()
-
-    if conf == "alta":
-        st.success("Confiança da identificação: ALTA")
-    elif conf == "media":
-        st.warning("Confiança da identificação: MÉDIA — confira as fontes.")
+if st.session_state.results is not None:
+    res=st.session_state.results
+    if not res:
+        st.error("Não encontrei resultados suficientes para esse código.")
     else:
-        st.error("Confiança da identificação: BAIXA — não cadastre sem conferência.")
+        ident=extract_identity(res,pn)
+        st.subheader("Identificação encontrada")
 
-    if data.get("observacao"):
-        st.info(data["observacao"])
+        peca=st.text_input("Peça", value=ident["peca"])
+        marca=st.text_input("Marca", value=ident["marca"])
+        modelos=st.text_input("Modelo(s)", value=ident["modelos"])
+        anos=st.text_input("Anos de aplicação", value=ident["anos"])
 
-    fontes = data.get("fontes") or []
+        st.session_state.candidate = {
+            "peca":peca, "marca":marca, "modelos":modelos, "anos":anos
+        }
 
-    if fontes:
-        with st.expander("Ver fontes da pesquisa"):
-            for source in fontes:
-                if isinstance(source, dict):
-                    name = source.get("nome") or "Fonte"
-                    url = source.get("url") or ""
+        st.markdown("### A identificação está correta?")
+        a,b=st.columns(2)
+        if a.button("✅ SIM",type="primary"):
+            st.session_state.confirmed=True
+            st.rerun()
+        if b.button("❌ NÃO — NOVA PESQUISA"):
+            with st.spinner("Refazendo a pesquisa com outras variações..."):
+                st.session_state.results=search_web(canonical(pn))
+            st.session_state.confirmed=False
+            st.rerun()
 
-                    if url:
-                        st.markdown(f"- [{name}]({url})")
-                    else:
-                        st.write(f"- {name}")
-                else:
-                    st.write(f"- {source}")
+        with st.expander("Ver evidências/fontes"):
+            for r in ident["evidence"]:
+                st.markdown(f"**{r['title']}**")
+                st.write(r["body"])
+                st.markdown(f"[Abrir fonte]({r['url']})")
+                st.divider()
 
-    with st.expander("Variações consideradas na pesquisa"):
-        for variant in generate_partnumber_variants(pn_input):
-            st.code(variant, language=None)
+if st.session_state.confirmed:
+    st.success("✓ Identificação confirmada")
+    ident=st.session_state.candidate
+    st.markdown("### Dados confirmados")
+    peca=st.text_input("Nome da peça",value=ident.get("peca",""))
+    marca=st.text_input("Marca",value=ident.get("marca",""))
+    modelos=st.text_input("Modelo(s)",value=ident.get("modelos",""))
+    anos=st.text_input("Anos de aplicação",value=ident.get("anos",""))
+    if st.button("📝 GERAR CONTEÚDO",type="primary"):
+        data={"peca":peca,"marca":marca,"modelos":modelos,"anos":anos}
+        title=fit_title(" ".join(x for x in [peca,marca,modelos,anos] if x))
+        kws=keyword_text(data,pn)
+        desc=description(data,pn)
+        md=meta(data)
+        st.markdown('<div class="card"><div class="muted">TÍTULO</div><div class="title">'+html.escape(title)+'</div><div class="muted">'+str(len(title))+'/60 caracteres</div></div>',unsafe_allow_html=True)
+        st.text_area("Palavras-chave",kws,height=100)
+        st.text_area("Descrição completa",desc,height=230)
+        st.text_area("Meta description",md,height=100)
+        st.caption(f"{len(md)}/160 caracteres")
 
 st.divider()
 st.caption("Wise Moto Parts • Ferramenta interna de catalogação")
