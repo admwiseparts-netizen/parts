@@ -216,7 +216,7 @@ for k,v in {"results":None,"candidate":{},"confirmed":False}.items():
     if k not in st.session_state: st.session_state[k]=v
 
 st.title("🏍️ Wise Part Number")
-st.caption("Versão 3.1 • motor de identificação corrigido")
+st.caption("Versão 3.2 • pesquisa → título → confirmação → cadastro")
 st.caption("Pesquisa gratuita na web • sem OpenAI API e sem créditos.")
 
 pn=st.text_input("Digite o Part Number",placeholder="Ex.: B97-F3121-00 ou b97f312100")
@@ -232,34 +232,67 @@ if st.button("🔎 PESQUISAR PEÇA",type="primary"):
     st.session_state.confirmed=False
 
 if st.session_state.results is not None:
-    res=st.session_state.results
+    res = st.session_state.results
+
     if not res:
         st.error("Não encontrei resultados suficientes para esse código.")
     else:
-        ident=extract_identity(res,pn)
-        st.subheader("Identificação encontrada")
+        ident = extract_identity(res, pn)
 
-        peca=st.text_input("Peça", value=ident["peca"])
-        marca=st.text_input("Marca", value=ident["marca"])
-        modelos=st.text_input("Modelo(s)", value=ident["modelos"])
-        anos=st.text_input("Anos de aplicação", value=ident["anos"])
+        # Monta um único título completo.
+        titulo_encontrado = fit_title(
+            " ".join(
+                x for x in [
+                    ident.get("peca", ""),
+                    ident.get("marca", ""),
+                    ident.get("modelos", ""),
+                    ident.get("anos", "")
+                ] if x
+            )
+        )
 
+        st.subheader("Título encontrado")
+
+        if titulo_encontrado:
+            titulo_editado = st.text_input(
+                "Título do item",
+                value=titulo_encontrado,
+                max_chars=60,
+                label_visibility="collapsed"
+            )
+            titulo_editado = fit_title(titulo_editado)
+            st.caption(f"{len(titulo_editado)}/60 caracteres")
+        else:
+            titulo_editado = st.text_input(
+                "Título do item",
+                placeholder="Não foi possível montar um título automaticamente",
+                max_chars=60,
+                label_visibility="collapsed"
+            )
+
+        # Guarda internamente os dados estruturados, mas não polui a tela.
         st.session_state.candidate = {
-            "peca":peca, "marca":marca, "modelos":modelos, "anos":anos
+            "titulo": titulo_editado,
+            "peca": ident.get("peca", ""),
+            "marca": ident.get("marca", ""),
+            "modelos": ident.get("modelos", ""),
+            "anos": ident.get("anos", "")
         }
 
-        st.markdown("### A identificação está correta?")
-        a,b=st.columns(2)
-        if a.button("✅ SIM",type="primary"):
-            st.session_state.confirmed=True
-            st.rerun()
-        if b.button("❌ NÃO — NOVA PESQUISA"):
-            with st.spinner("Refazendo a pesquisa com outras variações..."):
-                st.session_state.results=search_web(canonical(pn))
-            st.session_state.confirmed=False
+        st.markdown("### Esse título está correto?")
+        col_sim, col_nao = st.columns(2)
+
+        if col_sim.button("✅ SIM, ESTÁ CORRETO", type="primary", use_container_width=True):
+            st.session_state.confirmed = True
             st.rerun()
 
-        with st.expander("Ver evidências/fontes"):
+        if col_nao.button("❌ NÃO, PESQUISAR NOVAMENTE", use_container_width=True):
+            with st.spinner("Refazendo a pesquisa com outras variações do código..."):
+                st.session_state.results = search_web(canonical(pn))
+            st.session_state.confirmed = False
+            st.rerun()
+
+        with st.expander("Ver fontes da pesquisa"):
             for r in ident["evidence"]:
                 st.markdown(f"**{r['title']}**")
                 st.write(r["body"])
@@ -267,24 +300,82 @@ if st.session_state.results is not None:
                 st.divider()
 
 if st.session_state.confirmed:
-    st.success("✓ Identificação confirmada")
-    ident=st.session_state.candidate
-    st.markdown("### Dados confirmados")
-    peca=st.text_input("Nome da peça",value=ident.get("peca",""))
-    marca=st.text_input("Marca",value=ident.get("marca",""))
-    modelos=st.text_input("Modelo(s)",value=ident.get("modelos",""))
-    anos=st.text_input("Anos de aplicação",value=ident.get("anos",""))
-    if st.button("📝 GERAR CONTEÚDO",type="primary"):
-        data={"peca":peca,"marca":marca,"modelos":modelos,"anos":anos}
-        title=fit_title(" ".join(x for x in [peca,marca,modelos,anos] if x))
-        kws=keyword_text(data,pn)
-        desc=description(data,pn)
-        md=meta(data)
-        st.markdown('<div class="card"><div class="muted">TÍTULO</div><div class="title">'+html.escape(title)+'</div><div class="muted">'+str(len(title))+'/60 caracteres</div></div>',unsafe_allow_html=True)
-        st.text_area("Palavras-chave",kws,height=100)
-        st.text_area("Descrição completa",desc,height=230)
-        st.text_area("Meta description",md,height=100)
-        st.caption(f"{len(md)}/160 caracteres")
+    ident = st.session_state.candidate
+    titulo = fit_title(ident.get("titulo", ""))
+
+    st.success("✓ Título confirmado")
+
+    st.markdown("### Título")
+    st.text_input(
+        "Título confirmado",
+        value=titulo,
+        max_chars=60,
+        disabled=True,
+        label_visibility="collapsed"
+    )
+    st.caption(f"{len(titulo)}/60 caracteres")
+
+    # Os dados extraídos ficam disponíveis para enriquecer o conteúdo,
+    # mas o colaborador não precisa preencher campos separados.
+    data = {
+        "peca": ident.get("peca", ""),
+        "marca": ident.get("marca", ""),
+        "modelos": ident.get("modelos", ""),
+        "anos": ident.get("anos", "")
+    }
+
+    kws = keyword_text(data, pn)
+    desc = description(data, pn)
+    md = meta(data)
+
+    st.markdown("## Conteúdo para cadastro")
+
+    st.markdown("### Palavras-chave")
+    st.text_area(
+        "Palavras-chave",
+        value=kws,
+        height=110,
+        label_visibility="collapsed"
+    )
+
+    st.markdown("### Descrição completa")
+    st.text_area(
+        "Descrição completa",
+        value=desc,
+        height=240,
+        label_visibility="collapsed"
+    )
+
+    st.markdown("### Meta description")
+    st.text_area(
+        "Meta description",
+        value=md,
+        height=100,
+        label_visibility="collapsed"
+    )
+    st.caption(f"{len(md)}/160 caracteres")
+
+    arquivo_txt = (
+        f"TÍTULO\n{titulo}\n\n"
+        f"PALAVRAS-CHAVE\n{kws}\n\n"
+        f"DESCRIÇÃO COMPLETA\n{desc}\n\n"
+        f"META DESCRIPTION\n{md}\n"
+    )
+
+    st.download_button(
+        "⬇️ BAIXAR CONTEÚDO .TXT",
+        data=arquivo_txt,
+        file_name=f"{canonical(pn)}_cadastro.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
+    if st.button("↩️ TÍTULO INCORRETO — PESQUISAR NOVAMENTE", use_container_width=True):
+        with st.spinner("Procurando outra identificação..."):
+            st.session_state.results = search_web(canonical(pn))
+        st.session_state.confirmed = False
+        st.rerun()
+
 
 st.divider()
 st.caption("Wise Moto Parts • Ferramenta interna de catalogação")
