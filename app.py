@@ -80,31 +80,115 @@ def search_web(pn):
                 pass
     return results
 
-def candidate_from_results(results, pn):
-    """Sem IA: usa títulos de resultados como candidatos e remove ruído comercial."""
-    can=canonical(pn)
-    candidates=[]
-    bad = re.compile(r"\b(compre|preço|mercado livre|shopee|amazon|ebay|frete|oferta|r\$)\b",re.I)
+PART_TERMS = [
+    "CAPA DO SILENCIADOR", "PROTETOR DO SILENCIADOR", "PROTETOR DO TUBO DE ESCAPE",
+    "CAPA PROTEÇÃO DO ESCAPAMENTO", "CAPA PROTECAO DO ESCAPAMENTO",
+    "CARENAGEM", "RABETA", "PARALAMA", "FAROL", "LANTERNA", "PISCA",
+    "SUPORTE", "PEDALEIRA", "MANOPLA", "MANETE", "RADIADOR", "PAINEL",
+    "BENGALA", "MESA SUPERIOR", "MESA INFERIOR", "BALANÇA", "BALANCA",
+    "BOMBA DE COMBUSTÍVEL", "BOMBA DE COMBUSTIVEL", "ESTATOR", "RETIFICADOR",
+    "VENTOINHA", "CHICOTE", "SENSOR", "TAMPA", "EMBREAGEM", "CABEÇOTE",
+    "CABECOTE", "MOTOR DE PARTIDA", "CDI", "ECM", "ESPELHO", "ESCAPAMENTO",
+    "SILENCIADOR", "PARAFUSO", "ARRUELA", "GAXETA", "VEDAÇÃO", "VEDACAO",
+    "COXIM", "BUCHA", "ROLAMENTO", "GUIDÃO", "GUIDAO"
+]
+
+BRANDS = [
+    "YAMAHA","HONDA","SUZUKI","KAWASAKI","BMW","DUCATI","BUELL",
+    "HARLEY-DAVIDSON","HARLEY DAVIDSON","TRIUMPH","DAFRA","SHINERAY",
+    "ROYAL ENFIELD","KTM","KYMCO","KASINSKI","HAOJUE"
+]
+
+def extract_identity(results, pn):
+    """Extrai evidências dos snippets sem IA e privilegia descrições OEM explícitas."""
+    can = canonical(pn)
+    texts = []
     for r in results:
-        t=html.unescape(r["title"])
-        # Remove site suffixes
-        t=re.split(r"\s+[|\-–—]\s+(?=[A-Z][A-Za-z0-9 .]+$)",t)[0]
-        # Remove PN in qualquer form
-        for v in variants(pn):
-            if v: t=re.sub(re.escape(v), "", t, flags=re.I)
-        t=re.sub(r"\s+"," ",t).strip(" -|:")
-        if len(t)>=8 and not bad.search(t):
-            candidates.append(t)
-    # Prefer title occurring with informative motorcycle terms and reasonable length
-    def score(t):
-        s=0
-        if 15<=len(t)<=80:s+=3
-        if re.search(r"\b(honda|yamaha|suzuki|kawasaki|bmw|ducati|buell|harley|triumph|dafra|shineray|royal enfield)\b",t,re.I):s+=4
-        if re.search(r"\b(19|20)\d{2}\b",t):s+=2
-        if re.search(r"\b(carenagem|farol|suporte|pedaleira|radiador|manopla|tampa|motor|guidão|guidao|painel|bengala|rabeta|paralama|chicote|sensor|bomba|embreagem|válvula|valvula)\b",t,re.I):s+=3
-        return s
-    candidates.sort(key=score, reverse=True)
-    return candidates[:5]
+        blob = html.unescape((r.get("title","") + " " + r.get("body","")).upper())
+        compact = re.sub(r"[^A-Z0-9]", "", blob)
+        # Prioriza páginas onde o PN realmente aparece.
+        if can in compact:
+            texts.append(blob)
+
+    if not texts:
+        texts = [html.unescape((r.get("title","")+" "+r.get("body","")).upper()) for r in results]
+
+    joined = " ".join(texts)
+
+    # Nome da peça: procura vocabulário técnico próximo ao código e também termos conhecidos.
+    found_parts = []
+    for term in PART_TERMS:
+        count = joined.count(term)
+        if count:
+            found_parts.append((count, len(term), term))
+    found_parts.sort(reverse=True)
+
+    peca = found_parts[0][2].title() if found_parts else ""
+
+    # Corrige capitalização técnica comum.
+    fixes = {
+        "Capa Do Silenciador":"Capa do Silenciador",
+        "Protetor Do Silenciador":"Protetor do Silenciador",
+        "Protetor Do Tubo De Escape":"Protetor do Tubo de Escape",
+        "Capa Proteção Do Escapamento":"Capa Proteção do Escapamento",
+        "Capa Protecao Do Escapamento":"Capa Proteção do Escapamento",
+        "Bomba De Combustível":"Bomba de Combustível",
+        "Bomba De Combustivel":"Bomba de Combustível",
+        "Motor De Partida":"Motor de Partida",
+    }
+    peca = fixes.get(peca, peca)
+
+    marca = ""
+    for b in BRANDS:
+        if b in joined:
+            marca = b.title().replace("Bmw","BMW").replace("Ktm","KTM")
+            break
+
+    # Modelos: extrai expressões recorrentes em resultados.
+    model_patterns = [
+        r"\bYS\s*250\b", r"\bFAZER\s*250\b", r"\bFZ25\b", r"\bMT[- ]?03\b",
+        r"\bYZF[- ]?R3\b", r"\bNMAX\s*160\b", r"\bLANDER\s*250\b",
+        r"\bCROSSER\s*150\b", r"\bFACTOR\s*(?:125|150)\b",
+        r"\bCG\s*(?:125|150|160)\b", r"\bCBX\s*250\b", r"\bCB\s*300R?\b",
+        r"\bXRE\s*300\b", r"\bBROS\s*160\b", r"\bPCX\s*(?:150|160)\b",
+        r"\bCBR\s*\d+\w*\b", r"\bNINJA\s*\d+\b"
+    ]
+    mods=[]
+    for pat in model_patterns:
+        for m in re.findall(pat, joined, flags=re.I):
+            val=re.sub(r"\s+"," ",m.upper()).strip()
+            if val not in mods: mods.append(val)
+    modelos = " / ".join(mods[:3])
+
+    # Anos: encontra faixas explícitas como 2011 a 2017, 11-17.
+    ranges=[]
+    for a,b in re.findall(r"\b(20\d{2})\s*(?:A|ATÉ|ATE|-)\s*(20\d{2})\b", joined):
+        pair=(int(a),int(b))
+        if 1990 <= pair[0] <= pair[1] <= 2035: ranges.append(pair)
+    for a,b in re.findall(r"\b(\d{2})\s*[-/]\s*(\d{2})\b", joined):
+        aa,bb=2000+int(a),2000+int(b)
+        if 2000 <= aa <= bb <= 2035: ranges.append((aa,bb))
+    anos=""
+    if ranges:
+        counts=Counter(ranges)
+        best=counts.most_common(1)[0][0]
+        anos=f"{best[0]} a {best[1]}"
+
+    # Evidências mais úteis.
+    evidence=[]
+    for r in results:
+        blob=(r.get("title","")+" "+r.get("body",""))
+        if can in canonical(blob):
+            evidence.append(r)
+    if not evidence: evidence=results
+
+    return {
+        "peca": peca,
+        "marca": marca,
+        "modelos": modelos,
+        "anos": anos,
+        "evidence": evidence[:12]
+    }
 
 def keyword_text(data, pn):
     bits=[data.get("peca",""),data.get("marca",""),data.get("modelos",""),data.get("anos",""),pn,canonical(pn)]
@@ -152,18 +236,21 @@ if st.session_state.results is not None:
     if not res:
         st.error("Não encontrei resultados suficientes para esse código.")
     else:
-        st.subheader("Resultado encontrado")
-        cands=candidate_from_results(res,pn)
-        if cands:
-            choice=st.selectbox("Qual identificação parece correta?",cands,index=0)
-        else:
-            choice=st.text_input("Identificação da peça","")
-        st.caption("Como esta versão não usa IA, confirme a identificação com as fontes abaixo.")
+        ident=extract_identity(res,pn)
+        st.subheader("Identificação encontrada")
 
-        st.markdown("### A peça está correta?")
+        peca=st.text_input("Peça", value=ident["peca"])
+        marca=st.text_input("Marca", value=ident["marca"])
+        modelos=st.text_input("Modelo(s)", value=ident["modelos"])
+        anos=st.text_input("Anos de aplicação", value=ident["anos"])
+
+        st.session_state.candidate = {
+            "peca":peca, "marca":marca, "modelos":modelos, "anos":anos
+        }
+
+        st.markdown("### A identificação está correta?")
         a,b=st.columns(2)
         if a.button("✅ SIM",type="primary"):
-            st.session_state.candidate=choice
             st.session_state.confirmed=True
             st.rerun()
         if b.button("❌ NÃO — NOVA PESQUISA"):
@@ -172,8 +259,8 @@ if st.session_state.results is not None:
             st.session_state.confirmed=False
             st.rerun()
 
-        with st.expander("Ver resultados/fontes da pesquisa"):
-            for r in res[:15]:
+        with st.expander("Ver evidências/fontes"):
+            for r in ident["evidence"]:
                 st.markdown(f"**{r['title']}**")
                 st.write(r["body"])
                 st.markdown(f"[Abrir fonte]({r['url']})")
@@ -182,11 +269,11 @@ if st.session_state.results is not None:
 if st.session_state.confirmed:
     st.success("✓ Identificação confirmada")
     ident=st.session_state.candidate
-    st.markdown("### Complete os dados para gerar o cadastro")
-    peca=st.text_input("Nome da peça",value=ident)
-    marca=st.text_input("Marca")
-    modelos=st.text_input("Modelo(s)")
-    anos=st.text_input("Anos de aplicação")
+    st.markdown("### Dados confirmados")
+    peca=st.text_input("Nome da peça",value=ident.get("peca",""))
+    marca=st.text_input("Marca",value=ident.get("marca",""))
+    modelos=st.text_input("Modelo(s)",value=ident.get("modelos",""))
+    anos=st.text_input("Anos de aplicação",value=ident.get("anos",""))
     if st.button("📝 GERAR CONTEÚDO",type="primary"):
         data={"peca":peca,"marca":marca,"modelos":modelos,"anos":anos}
         title=fit_title(" ".join(x for x in [peca,marca,modelos,anos] if x))
